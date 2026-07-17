@@ -10,6 +10,12 @@
 -- de chargement COPY → aucun doublon possible en relançant le script.
 -- ATTENTION : le stage, lui, reste en IF NOT EXISTS pour NE PAS effacer
 -- les fichiers déjà uploadés (un OR REPLACE supprimerait tout le contenu).
+--
+-- POINT DE VIGILANCE (à mentionner dans le README) :
+-- les identifiants du dataset sont ALPHANUMÉRIQUES ('O0000001', 'C005654'),
+-- pas numériques, et order_date contient date + heure. Les colonnes ID sont
+-- donc typées VARCHAR et ORDER_DATE en TIMESTAMP_NTZ. Leçon : toujours
+-- prévisualiser les fichiers avant de figer un schéma.
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
@@ -92,16 +98,6 @@ USE SCHEMA RAW;
 CREATE STAGE IF NOT EXISTS RAW.STAGE_LANDING
   COMMENT = 'Stage interne recevant les fichiers sources (lots J1 et J2)';
 
--- >>> UPLOAD DES FICHIERS (dossier j1/ du stage) <<<
--- Option A — SnowSQL (depuis votre machine, dans le dossier data/j1) :
---   PUT file://orders.csv        @SHOPFLOW_DB.RAW.STAGE_LANDING/j1/ AUTO_COMPRESS=FALSE;
---   PUT file://order_items.csv   @SHOPFLOW_DB.RAW.STAGE_LANDING/j1/ AUTO_COMPRESS=FALSE;
---   PUT file://customers.parquet @SHOPFLOW_DB.RAW.STAGE_LANDING/j1/ AUTO_COMPRESS=FALSE;
---
--- Option B — Snowsight UI (méthode utilisée ici) :
---   Data > Databases > SHOPFLOW_DB > RAW > Stages > STAGE_LANDING
---   > + Files > spécifier le chemin /j1
-
 -- Vérifier la présence des fichiers dans le dossier j1/
 LIST @RAW.STAGE_LANDING/j1/;
 
@@ -115,8 +111,8 @@ CREATE OR REPLACE FILE FORMAT RAW.FF_CSV_ORDERS
   FIELD_OPTIONALLY_ENCLOSED_BY = '"'
   NULL_IF                      = ('', 'NULL', 'null')
   EMPTY_FIELD_AS_NULL          = TRUE
-  -- FALSE nécessaire : les tables cibles ont 2 colonnes d'audit en plus
-  -- (_LOADED_AT, _SOURCE_FILE) par rapport aux fichiers sources
+  -- FALSE nécessaire pour les COPY de VALIDATION_MODE : les tables cibles
+  -- ont 2 colonnes d'audit (_LOADED_AT, _SOURCE_FILE) de plus que les fichiers
   ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE
   COMMENT = 'Format CSV avec headers pour orders et order_items';
 
@@ -126,21 +122,32 @@ CREATE OR REPLACE FILE FORMAT RAW.FF_PARQUET
 
 -- ----------------------------------------------------------------------------
 -- 7. Tables cibles RAW + COPY INTO
---    CREATE OR REPLACE = table vidée + recréée + historique COPY réinitialisé
---    → le script peut être relancé autant de fois que nécessaire sans doublons
+--    Types alignés sur les données réelles :
+--      ORDER_ID / CUSTOMER_ID / PRODUCT_ID → VARCHAR (préfixes O/C/P)
+--      ORDER_DATE → TIMESTAMP_NTZ (le CSV contient date + heure)
+--    _SOURCE_FILE est rempli par un littéral (chaque COPY cible un fichier
+--    précis). La variante METADATA$FILENAME, pourtant documentée, provoque
+--    l'erreur interne « $METADATA$kFilename » sur certains environnements —
+--    le littéral est 100 % fiable ici.
 -- ----------------------------------------------------------------------------
 
 -- 7.1 ORDERS ------------------------------------------------------------------
 CREATE OR REPLACE TABLE RAW.ORDERS_RAW (
-  ORDER_ID      NUMBER,
-  CUSTOMER_ID   NUMBER,
-  ORDER_DATE    DATE,
+  ORDER_ID      VARCHAR,          -- ex : 'O0000001'
+  CUSTOMER_ID   VARCHAR,          -- ex : 'C005654'
+  ORDER_DATE    TIMESTAMP_NTZ,    -- ex : 2026-05-05 15:56:00
   STATUS        VARCHAR,
   TOTAL_AMOUNT  NUMBER(12,2),
   -- Métadonnées d'ingestion (utiles pour le debug et l'audit)
   _LOADED_AT    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
   _SOURCE_FILE  VARCHAR
 );
+
+-- Aperçu du fichier À TRAVERS le file format : contrôle visuel du parsing
+-- (c'est ce contrôle qui révèle les IDs alphanumériques et les timestamps)
+SELECT t.$1, t.$2, t.$3, t.$4, t.$5
+FROM @RAW.STAGE_LANDING/j1/orders.csv (FILE_FORMAT => 'RAW.FF_CSV_ORDERS') t
+LIMIT 10;
 
 -- Contrôle préalable : valider le fichier SANS charger (détecte les erreurs)
 COPY INTO RAW.ORDERS_RAW
@@ -149,17 +156,16 @@ FILES = ('j1/orders.csv')
 FILE_FORMAT = (FORMAT_NAME = 'RAW.FF_CSV_ORDERS')
 VALIDATION_MODE = 'RETURN_ERRORS';
 
--- Chargement réel : alias "t" + casts explicites (indispensable pour que
--- METADATA$FILENAME soit résolu correctement dans un COPY transformé)
+-- Chargement réel (casts explicites alignés sur les données réelles)
 COPY INTO RAW.ORDERS_RAW (ORDER_ID, CUSTOMER_ID, ORDER_DATE, STATUS, TOTAL_AMOUNT, _SOURCE_FILE)
 FROM (
   SELECT
-    t.$1::NUMBER,
-    t.$2::NUMBER,
-    t.$3::DATE,
+    t.$1::VARCHAR,
+    t.$2::VARCHAR,
+    t.$3::TIMESTAMP_NTZ,
     t.$4::VARCHAR,
     t.$5::NUMBER(12,2),
-    METADATA$FILENAME::VARCHAR
+    'j1/orders.csv'
   FROM @RAW.STAGE_LANDING/j1/orders.csv t
 )
 FILE_FORMAT = (FORMAT_NAME = 'RAW.FF_CSV_ORDERS')
@@ -167,13 +173,18 @@ ON_ERROR = 'ABORT_STATEMENT';
 
 -- 7.2 ORDER_ITEMS -------------------------------------------------------------
 CREATE OR REPLACE TABLE RAW.ORDER_ITEMS_RAW (
-  ORDER_ID      NUMBER,
-  PRODUCT_ID    NUMBER,
+  ORDER_ID      VARCHAR,          -- ex : 'O0000001'
+  PRODUCT_ID    VARCHAR,          -- IDs produits vraisemblablement 'P...'
   QUANTITY      NUMBER,
   UNIT_PRICE    NUMBER(12,2),
   _LOADED_AT    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
   _SOURCE_FILE  VARCHAR
 );
+
+-- Aperçu (vérifier notamment le format de PRODUCT_ID)
+SELECT t.$1, t.$2, t.$3, t.$4
+FROM @RAW.STAGE_LANDING/j1/order_items.csv (FILE_FORMAT => 'RAW.FF_CSV_ORDERS') t
+LIMIT 10;
 
 COPY INTO RAW.ORDER_ITEMS_RAW
 FROM @RAW.STAGE_LANDING
@@ -184,11 +195,11 @@ VALIDATION_MODE = 'RETURN_ERRORS';
 COPY INTO RAW.ORDER_ITEMS_RAW (ORDER_ID, PRODUCT_ID, QUANTITY, UNIT_PRICE, _SOURCE_FILE)
 FROM (
   SELECT
-    t.$1::NUMBER,
-    t.$2::NUMBER,
+    t.$1::VARCHAR,
+    t.$2::VARCHAR,
     t.$3::NUMBER,
     t.$4::NUMBER(12,2),
-    METADATA$FILENAME::VARCHAR
+    'j1/order_items.csv'
   FROM @RAW.STAGE_LANDING/j1/order_items.csv t
 )
 FILE_FORMAT = (FORMAT_NAME = 'RAW.FF_CSV_ORDERS')
@@ -202,7 +213,7 @@ FROM @RAW.STAGE_LANDING/j1/customers.parquet
 LIMIT 5;
 
 CREATE OR REPLACE TABLE RAW.CUSTOMERS_RAW (
-  CUSTOMER_ID   NUMBER,
+  CUSTOMER_ID   VARCHAR,          -- ex : 'C005654'
   EMAIL         VARCHAR,
   FIRST_NAME    VARCHAR,
   LAST_NAME     VARCHAR,
@@ -216,13 +227,13 @@ CREATE OR REPLACE TABLE RAW.CUSTOMERS_RAW (
 COPY INTO RAW.CUSTOMERS_RAW (CUSTOMER_ID, EMAIL, FIRST_NAME, LAST_NAME, CITY, SIGNUP_DATE, _SOURCE_FILE)
 FROM (
   SELECT
-    t.$1:customer_id::NUMBER,
+    t.$1:customer_id::VARCHAR,
     t.$1:email::VARCHAR,
     t.$1:first_name::VARCHAR,
     t.$1:last_name::VARCHAR,
     t.$1:city::VARCHAR,
     t.$1:signup_date::DATE,
-    METADATA$FILENAME::VARCHAR
+    'j1/customers.parquet'
   FROM @RAW.STAGE_LANDING/j1/customers.parquet t
 )
 FILE_FORMAT = (FORMAT_NAME = 'RAW.FF_PARQUET')
@@ -263,4 +274,5 @@ WHERE o.ORDER_ID IS NULL;
 --    "Invalid state" — sans gravité, elle peut être ignorée.
 -- ----------------------------------------------------------------------------
 ALTER WAREHOUSE WH_INGEST    SUSPEND;
+USE WAREHOUSE COMPUTE_WH;
 ALTER WAREHOUSE WH_TRANSFORM SUSPEND;
