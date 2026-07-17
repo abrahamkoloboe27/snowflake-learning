@@ -1,7 +1,15 @@
+-- ShopFlow Day 1: Database setup, staging, and structured data ingestion
+-- Co-authored with CoCo
 -- ============================================================================
 -- ShopFlow — Jour 1 : Fondations & ingestion structurée
 -- Fichier : 01_setup_and_ingest.sql
 -- Prérequis : rôle ACCOUNTADMIN (ou SYSADMIN + SECURITYADMIN) pour le setup
+--
+-- SCRIPT REJOUABLE : les tables RAW sont recréées à chaque exécution
+-- (CREATE OR REPLACE), ce qui vide les données ET réinitialise l'historique
+-- de chargement COPY → aucun doublon possible en relançant le script.
+-- ATTENTION : le stage, lui, reste en IF NOT EXISTS pour NE PAS effacer
+-- les fichiers déjà uploadés (un OR REPLACE supprimerait tout le contenu).
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
@@ -50,8 +58,8 @@ CREATE ROLE IF NOT EXISTS SHOPFLOW_ENGINEER
 -- Rattacher le rôle à la hiérarchie (bonne pratique : sous SYSADMIN)
 GRANT ROLE SHOPFLOW_ENGINEER TO ROLE SYSADMIN;
 
--- Se donner le rôle à soi-même (remplacer par votre username)
-GRANT ROLE SHOPFLOW_ENGINEER TO USER PCBCYYR-FHB82490;
+-- Se donner le rôle à soi-même
+GRANT ROLE SHOPFLOW_ENGINEER TO USER ABRAHAMKOLOBOE;
 
 -- Droits sur les warehouses
 GRANT USAGE, OPERATE ON WAREHOUSE WH_INGEST    TO ROLE SHOPFLOW_ENGINEER;
@@ -78,22 +86,24 @@ USE SCHEMA RAW;
 
 -- ----------------------------------------------------------------------------
 -- 5. Stage interne de landing
+--    IMPORTANT : IF NOT EXISTS (jamais OR REPLACE : cela effacerait les
+--    fichiers déjà présents sur le stage, y compris le dossier j1/)
 -- ----------------------------------------------------------------------------
 CREATE STAGE IF NOT EXISTS RAW.STAGE_LANDING
   COMMENT = 'Stage interne recevant les fichiers sources (lots J1 et J2)';
 
--- >>> UPLOAD DES FICHIERS <<<
+-- >>> UPLOAD DES FICHIERS (dossier j1/ du stage) <<<
 -- Option A — SnowSQL (depuis votre machine, dans le dossier data/j1) :
---   PUT file://orders.csv          @SHOPFLOW_DB.RAW.STAGE_LANDING AUTO_COMPRESS=TRUE;
---   PUT file://order_items.csv     @SHOPFLOW_DB.RAW.STAGE_LANDING AUTO_COMPRESS=TRUE;
---   PUT file://customers.parquet   @SHOPFLOW_DB.RAW.STAGE_LANDING AUTO_COMPRESS=FALSE;
---   (Parquet est déjà compressé snappy : ne pas re-compresser)
+--   PUT file://orders.csv        @SHOPFLOW_DB.RAW.STAGE_LANDING/j1/ AUTO_COMPRESS=FALSE;
+--   PUT file://order_items.csv   @SHOPFLOW_DB.RAW.STAGE_LANDING/j1/ AUTO_COMPRESS=FALSE;
+--   PUT file://customers.parquet @SHOPFLOW_DB.RAW.STAGE_LANDING/j1/ AUTO_COMPRESS=FALSE;
 --
--- Option B — Snowsight UI :
---   Data > Databases > SHOPFLOW_DB > RAW > Stages > STAGE_LANDING > + Files
+-- Option B — Snowsight UI (méthode utilisée ici) :
+--   Data > Databases > SHOPFLOW_DB > RAW > Stages > STAGE_LANDING
+--   > + Files > spécifier le chemin /j1
 
--- Vérifier la présence des fichiers sur le stage
-LIST @RAW.STAGE_LANDING;
+-- Vérifier la présence des fichiers dans le dossier j1/
+LIST @RAW.STAGE_LANDING/j1/;
 
 -- ----------------------------------------------------------------------------
 -- 6. File formats
@@ -105,7 +115,9 @@ CREATE OR REPLACE FILE FORMAT RAW.FF_CSV_ORDERS
   FIELD_OPTIONALLY_ENCLOSED_BY = '"'
   NULL_IF                      = ('', 'NULL', 'null')
   EMPTY_FIELD_AS_NULL          = TRUE
-  ERROR_ON_COLUMN_COUNT_MISMATCH = TRUE
+  -- FALSE nécessaire : les tables cibles ont 2 colonnes d'audit en plus
+  -- (_LOADED_AT, _SOURCE_FILE) par rapport aux fichiers sources
+  ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE
   COMMENT = 'Format CSV avec headers pour orders et order_items';
 
 CREATE OR REPLACE FILE FORMAT RAW.FF_PARQUET
@@ -114,6 +126,8 @@ CREATE OR REPLACE FILE FORMAT RAW.FF_PARQUET
 
 -- ----------------------------------------------------------------------------
 -- 7. Tables cibles RAW + COPY INTO
+--    CREATE OR REPLACE = table vidée + recréée + historique COPY réinitialisé
+--    → le script peut être relancé autant de fois que nécessaire sans doublons
 -- ----------------------------------------------------------------------------
 
 -- 7.1 ORDERS ------------------------------------------------------------------
@@ -129,19 +143,25 @@ CREATE OR REPLACE TABLE RAW.ORDERS_RAW (
 );
 
 -- Contrôle préalable : valider le fichier SANS charger (détecte les erreurs)
-COPY INTO RAW.ORDERS_RAW (ORDER_ID, CUSTOMER_ID, ORDER_DATE, STATUS, TOTAL_AMOUNT)
+COPY INTO RAW.ORDERS_RAW
 FROM @RAW.STAGE_LANDING
-FILES = ('orders.csv.gz')          -- .gz si uploadé avec AUTO_COMPRESS=TRUE
+FILES = ('j1/orders.csv')
 FILE_FORMAT = (FORMAT_NAME = 'RAW.FF_CSV_ORDERS')
 VALIDATION_MODE = 'RETURN_ERRORS';
 
--- Chargement réel (avec capture du nom de fichier source)
+-- Chargement réel : alias "t" + casts explicites (indispensable pour que
+-- METADATA$FILENAME soit résolu correctement dans un COPY transformé)
 COPY INTO RAW.ORDERS_RAW (ORDER_ID, CUSTOMER_ID, ORDER_DATE, STATUS, TOTAL_AMOUNT, _SOURCE_FILE)
 FROM (
-  SELECT $1, $2, $3, $4, $5, METADATA$FILENAME
-  FROM @RAW.STAGE_LANDING
+  SELECT
+    t.$1::NUMBER,
+    t.$2::NUMBER,
+    t.$3::DATE,
+    t.$4::VARCHAR,
+    t.$5::NUMBER(12,2),
+    METADATA$FILENAME::VARCHAR
+  FROM @RAW.STAGE_LANDING/j1/orders.csv t
 )
-FILES = ('orders.csv.gz')
 FILE_FORMAT = (FORMAT_NAME = 'RAW.FF_CSV_ORDERS')
 ON_ERROR = 'ABORT_STATEMENT';
 
@@ -155,25 +175,29 @@ CREATE OR REPLACE TABLE RAW.ORDER_ITEMS_RAW (
   _SOURCE_FILE  VARCHAR
 );
 
-COPY INTO RAW.ORDER_ITEMS_RAW (ORDER_ID, PRODUCT_ID, QUANTITY, UNIT_PRICE)
+COPY INTO RAW.ORDER_ITEMS_RAW
 FROM @RAW.STAGE_LANDING
-FILES = ('order_items.csv.gz')
+FILES = ('j1/order_items.csv')
 FILE_FORMAT = (FORMAT_NAME = 'RAW.FF_CSV_ORDERS')
 VALIDATION_MODE = 'RETURN_ERRORS';
 
 COPY INTO RAW.ORDER_ITEMS_RAW (ORDER_ID, PRODUCT_ID, QUANTITY, UNIT_PRICE, _SOURCE_FILE)
 FROM (
-  SELECT $1, $2, $3, $4, METADATA$FILENAME
-  FROM @RAW.STAGE_LANDING
+  SELECT
+    t.$1::NUMBER,
+    t.$2::NUMBER,
+    t.$3::NUMBER,
+    t.$4::NUMBER(12,2),
+    METADATA$FILENAME::VARCHAR
+  FROM @RAW.STAGE_LANDING/j1/order_items.csv t
 )
-FILES = ('order_items.csv.gz')
 FILE_FORMAT = (FORMAT_NAME = 'RAW.FF_CSV_ORDERS')
 ON_ERROR = 'ABORT_STATEMENT';
 
 -- 7.3 CUSTOMERS (Parquet) -----------------------------------------------------
 -- Astuce : avec Parquet, on peut inspecter le schéma avant de créer la table
 SELECT $1
-FROM @RAW.STAGE_LANDING/customers.parquet
+FROM @RAW.STAGE_LANDING/j1/customers.parquet
 (FILE_FORMAT => 'RAW.FF_PARQUET')
 LIMIT 5;
 
@@ -188,18 +212,18 @@ CREATE OR REPLACE TABLE RAW.CUSTOMERS_RAW (
   _SOURCE_FILE  VARCHAR
 );
 
--- Parquet est colonnaire : on extrait les champs depuis $1 (VARIANT)
+-- Parquet est colonnaire : on extrait les champs depuis t.$1 (VARIANT)
 COPY INTO RAW.CUSTOMERS_RAW (CUSTOMER_ID, EMAIL, FIRST_NAME, LAST_NAME, CITY, SIGNUP_DATE, _SOURCE_FILE)
 FROM (
   SELECT
-    $1:customer_id::NUMBER,
-    $1:email::VARCHAR,
-    $1:first_name::VARCHAR,
-    $1:last_name::VARCHAR,
-    $1:city::VARCHAR,
-    $1:signup_date::DATE,
-    METADATA$FILENAME
-  FROM @RAW.STAGE_LANDING/customers.parquet
+    t.$1:customer_id::NUMBER,
+    t.$1:email::VARCHAR,
+    t.$1:first_name::VARCHAR,
+    t.$1:last_name::VARCHAR,
+    t.$1:city::VARCHAR,
+    t.$1:signup_date::DATE,
+    METADATA$FILENAME::VARCHAR
+  FROM @RAW.STAGE_LANDING/j1/customers.parquet t
 )
 FILE_FORMAT = (FORMAT_NAME = 'RAW.FF_PARQUET')
 ON_ERROR = 'ABORT_STATEMENT';
@@ -213,6 +237,10 @@ UNION ALL
 SELECT 'ORDER_ITEMS_RAW', COUNT(*) FROM RAW.ORDER_ITEMS_RAW
 UNION ALL
 SELECT 'CUSTOMERS_RAW',   COUNT(*) FROM RAW.CUSTOMERS_RAW;
+
+-- Doublons ? Chaque clé doit apparaître exactement une fois
+SELECT COUNT(*) AS NB_LIGNES, COUNT(DISTINCT ORDER_ID) AS NB_ORDER_ID_DISTINCTS
+FROM RAW.ORDERS_RAW;
 
 -- Historique des chargements (statuts, lignes chargées, erreurs)
 SELECT FILE_NAME, STATUS, ROW_COUNT, ROW_PARSED, FIRST_ERROR_MESSAGE
@@ -231,6 +259,8 @@ WHERE o.ORDER_ID IS NULL;
 
 -- ----------------------------------------------------------------------------
 -- 9. Fin de journée : suspendre les warehouses (contrainte du projet)
+--    NB : si un warehouse est déjà suspendu, Snowflake renvoie une erreur
+--    "Invalid state" — sans gravité, elle peut être ignorée.
 -- ----------------------------------------------------------------------------
 ALTER WAREHOUSE WH_INGEST    SUSPEND;
 ALTER WAREHOUSE WH_TRANSFORM SUSPEND;
