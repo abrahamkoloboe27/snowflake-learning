@@ -1,0 +1,6 @@
+*.toml
+*.toml.example
+*.logs
+*.log
+logs/
+__pycache__
