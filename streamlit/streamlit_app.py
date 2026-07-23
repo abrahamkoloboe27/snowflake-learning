@@ -73,7 +73,7 @@ st.markdown(
       h1 {
         text-align: center;
         color: #FFFFFF;
-        background: linear-gradient(135deg, #1B2A41 0%, #2E6E8E 100%);
+        background: linear-gradient(135deg, #E0A458 0%, #BC4B51 100%);
         border-radius: 14px;
         padding: 22px 20px;
         margin: 0.2rem 0 2.2rem 0;
