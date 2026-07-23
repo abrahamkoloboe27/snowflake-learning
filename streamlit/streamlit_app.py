@@ -20,67 +20,25 @@ import os
 import sys
 import time
 from datetime import timedelta
-from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from loguru import logger
+import logging
 from plotly.subplots import make_subplots
 
 # ----------------------------------------------------------------------------
-# Logging (loguru) — logs visibles en console + fichier rotatif, niveau DEBUG
+# Logging (stdlib) — console uniquement
 # ----------------------------------------------------------------------------
-# Configurable via variables d'environnement :
-#   SHOPFLOW_LOG_LEVEL  (défaut : DEBUG)
-#   SHOPFLOW_LOG_DIR    (défaut : ./logs à côté du script)
 LOG_LEVEL = os.getenv("SHOPFLOW_LOG_LEVEL", "DEBUG").upper()
-LOG_DIR = Path(os.getenv("SHOPFLOW_LOG_DIR", Path(__file__).parent / "logs"))
-LOG_FILE = LOG_DIR / "shopflow_app.log"
 
-_LOG_FORMAT = (
-    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-    "<level>{level: <8}</level> | "
-    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-    "<level>{message}</level>"
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s",
+    stream=sys.stderr,
 )
-
-
-@st.cache_resource
-def setup_logging():
-    """Configure loguru une seule fois par session Streamlit.
-
-    Deux sinks :
-      • console (stderr) — logs immédiatement visibles lors de l'exécution
-      • fichier rotatif  — historique persistant (rotation 5 Mo, rétention 7 j)
-    """
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger.remove()  # retire le handler par défaut
-    logger.add(
-        sys.stderr,
-        level=LOG_LEVEL,
-        format=_LOG_FORMAT,
-        colorize=True,
-        backtrace=True,
-        diagnose=True,
-    )
-    logger.add(
-        LOG_FILE,
-        level=LOG_LEVEL,
-        format=_LOG_FORMAT,
-        rotation="5 MB",
-        retention="7 days",
-        compression="zip",
-        enqueue=True,
-        backtrace=True,
-        diagnose=True,
-    )
-    logger.info("Logging initialisé — niveau={} — fichier={}", LOG_LEVEL, LOG_FILE)
-    return logger
-
-
-setup_logging()
+logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------------
 # Palette délibérée (bleu nuit + ambre) plutôt que les couleurs Plotly par défaut
@@ -98,17 +56,62 @@ CHART_H = 360
 
 st.set_page_config(page_title="ShopFlow • Dashboard", page_icon="📦", layout="wide")
 
-# Léger habillage : cartes KPI et titres de section
+# Habillage : cartes KPI + titres/sections centrés sur fond
 st.markdown(
     """
     <style>
       .block-container {padding-top: 2rem;}
+
+      /* Cartes KPI */
       div[data-testid="stMetric"] {
         background: #F7F8FA; border: 1px solid #E6E9EF;
         border-radius: 12px; padding: 14px 16px;
       }
       div[data-testid="stMetricLabel"] {color: #55607A;}
-      h2 {border-left: 4px solid #E0A458; padding-left: 12px; margin-top: 0.4rem;}
+
+      /* Titre principal (st.title → h1) — bandeau bleu nuit */
+      h1 {
+        text-align: center;
+        color: #FFFFFF;
+        background: linear-gradient(135deg, #1B2A41 0%, #2E6E8E 100%);
+        border-radius: 14px;
+        padding: 22px 20px;
+        margin: 0.2rem 0 2.2rem 0;
+        box-shadow: 0 2px 10px rgba(27, 42, 65, 0.18);
+        letter-spacing: 0.5px;
+      }
+
+      /* En-têtes de section (st.header → h2) — bandeau ambre clair */
+      h2 {
+        text-align: center;
+        color: #1B2A41;
+        background: #FDF3E3;
+        border: 1px solid #F0DFBF;
+        border-radius: 10px;
+        padding: 12px 16px;
+        margin: 2.6rem 0 1.4rem 0;
+        letter-spacing: 0.3px;
+      }
+
+      /* Sous-titres (st.subheader → h3) — pastille discrète centrée */
+      h3 {
+        text-align: center;
+        color: #2E6E8E;
+        background: #F2F6F8;
+        border-radius: 8px;
+        padding: 8px 14px;
+        margin: 0.6rem 0 1.2rem 0;
+        font-weight: 600;
+      }
+
+      /* Espace entre les titres et les graphiques Plotly / tableaux */
+      div[data-testid="stPlotlyChart"],
+      div[data-testid="stDataFrame"] {
+        margin-top: 0.6rem;
+      }
+
+      /* Légende sous le titre principal, centrée */
+      div[data-testid="stCaptionContainer"] {text-align: center;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -127,7 +130,7 @@ def get_session():
         logger.info("Session Snowpark active récupérée (mode Streamlit in Snowflake).")
         return session
     except Exception as exc:
-        logger.debug("Pas de session active ({}), bascule vers les secrets locaux.", exc)
+        logger.debug("Pas de session active (%s), bascule vers les secrets locaux.", exc)
         from snowflake.snowpark import Session
         session = Session.builder.configs(dict(st.secrets["snowflake"])).create()
         logger.info("Session Snowpark construite depuis secrets.toml (mode local).")
@@ -139,16 +142,16 @@ def run_query(sql: str) -> pd.DataFrame:
     """Exécute une requête et renvoie un DataFrame (colonnes en MAJUSCULES)."""
     # SQL condensé sur une ligne pour un log lisible
     sql_compact = " ".join(sql.split())
-    logger.debug("Exécution SQL : {}", sql_compact)
+    logger.debug("Exécution SQL : %s", sql_compact)
     t0 = time.perf_counter()
     try:
         df = get_session().sql(sql).to_pandas()
     except Exception:
-        logger.exception("Échec de la requête SQL : {}", sql_compact)
+        logger.exception("Échec de la requête SQL : %s", sql_compact)
         raise
     elapsed_ms = (time.perf_counter() - t0) * 1000
     logger.debug(
-        "Requête OK — {} lignes × {} colonnes en {:.0f} ms",
+        "Requête OK — %s lignes × %s colonnes en %.0f ms",
         len(df), df.shape[1], elapsed_ms,
     )
     return df
@@ -193,7 +196,7 @@ def load_filter_options():
         f"WHERE DEVICE IS NOT NULL ORDER BY 1"
     )["DEVICE"].tolist()
     logger.info(
-        "Options de filtres chargées — bornes {}→{}, {} statuts, {} catégories, {} appareils",
+        "Options de filtres chargées — bornes %s→%s, %s statuts, %s catégories, %s appareils",
         bornes["DMIN"], bornes["DMAX"], len(statuts), len(categories), len(devices),
     )
     return pd.to_datetime(bornes["DMIN"]).date(), pd.to_datetime(bornes["DMAX"]).date(), statuts, categories, devices
@@ -238,8 +241,8 @@ if st.sidebar.button("🔄 Rafraîchir les données", use_container_width=True):
     st.rerun()
 
 logger.debug(
-    "Filtres actifs — période={}→{}, statuts={}, catégories={}, appareils={}, "
-    "granularité={}, top_n={}",
+    "Filtres actifs — période=%s→%s, statuts=%s, catégories=%s, appareils=%s, "
+    "granularité=%s, top_n=%s",
     date_from, date_to, statuts, categories or "toutes", devices or "tous",
     granularite, top_n,
 )
@@ -271,7 +274,7 @@ if daily.empty:
     logger.warning("Aucune commande pour les filtres courants — arrêt du rendu (st.stop).")
     st.warning("Aucune commande ne correspond aux filtres. Élargissez la période ou les statuts.")
     st.stop()
-logger.debug("Série journalière chargée : {} jours de données.", len(daily))
+    logger.debug("Série journalière chargée : %s jours de données.", len(daily))
 
 daily["ORDER_DATE"] = pd.to_datetime(daily["ORDER_DATE"])
 dernier_jour = daily["ORDER_DATE"].max().date()
