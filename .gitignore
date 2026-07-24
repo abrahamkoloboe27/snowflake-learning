@@ -1,5 +1,4 @@
 *.toml
-*.toml.example
 *.logs
 *.log
 logs/
